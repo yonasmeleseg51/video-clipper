@@ -25,13 +25,15 @@ import { fetchFile, getFFmpeg, isCrossOriginIsolated } from "@/lib/ffmpeg-client
 
 const INPUT_NAME = "input.mp4"
 const FRAME_COUNT = 8
+const OUTPUT_NAME = "out.mp4"
 
 type Status =
   | { kind: "idle" }
   | { kind: "loading-ffmpeg" }
   | { kind: "loading-video" }
   | { kind: "ready" }
-  | { kind: "analyzing" }
+  | { kind: "analyzing"; phase: "frames"; current: number; total: number }
+  | { kind: "analyzing"; phase: "ai" }
   | { kind: "exporting"; progress: number }
   | { kind: "done"; url: string; filename: string }
 
@@ -43,6 +45,43 @@ function uint8ToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode.apply(null, Array.from(slice))
   }
   return btoa(binary)
+}
+
+/**
+ * Some MP4 containers (fragmented MP4, screen recordings, files saved
+ * mid-stream) report `video.duration === Infinity` until the playhead
+ * has been seeked past the end of the file, which forces the browser
+ * to scan the moov box. This helper triggers that scan on demand.
+ */
+function resolveVideoDuration(video: HTMLVideoElement): Promise<number> {
+  return new Promise((resolve) => {
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      resolve(video.duration)
+      return
+    }
+    const onDurationChange = () => {
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        video.removeEventListener("durationchange", onDurationChange)
+        // restore the playhead - we yanked it to 1e9 to force the scan
+        try {
+          video.currentTime = 0
+        } catch {
+          // ignore
+        }
+        resolve(video.duration)
+      }
+    }
+    video.addEventListener("durationchange", onDurationChange)
+    try {
+      video.currentTime = 1e9
+    } catch {
+      // some browsers reject the seek; fall back after a beat
+      setTimeout(() => {
+        video.removeEventListener("durationchange", onDurationChange)
+        resolve(Number.isFinite(video.duration) ? video.duration : 0)
+      }, 500)
+    }
+  })
 }
 
 export function ClipperApp() {
@@ -125,10 +164,16 @@ export function ClipperApp() {
     [log, videoUrl],
   )
 
-  const handleLoadedMetadata = () => {
+  const handleLoadedMetadata = async () => {
     const v = videoRef.current
     if (!v) return
-    const d = v.duration
+    const d = await resolveVideoDuration(v)
+    if (!Number.isFinite(d) || d <= 0) {
+      setError(
+        "Could not determine the video duration. Try re-encoding the file or use a different format.",
+      )
+      return
+    }
     setDuration(d)
     setRange({ start: 0, end: Math.min(d, 30) })
   }
@@ -156,7 +201,7 @@ export function ClipperApp() {
   const analyze = async () => {
     if (!file || duration <= 0) return
     setError(null)
-    setStatus({ kind: "analyzing" })
+    setStatus({ kind: "analyzing", phase: "frames", current: 0, total: FRAME_COUNT })
 
     try {
       const ffmpeg = await getFFmpeg(log)
@@ -165,6 +210,7 @@ export function ClipperApp() {
       // Extract evenly spaced frames. Avoid the very first and very last.
       const step = duration / (FRAME_COUNT + 1)
       for (let i = 1; i <= FRAME_COUNT; i++) {
+        setStatus({ kind: "analyzing", phase: "frames", current: i, total: FRAME_COUNT })
         const ts = step * i
         const out = `frame_${i}.jpg`
         await ffmpeg.exec([
@@ -186,6 +232,8 @@ export function ClipperApp() {
         await ffmpeg.deleteFile(out)
       }
 
+      setStatus({ kind: "analyzing", phase: "ai" })
+
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -196,11 +244,24 @@ export function ClipperApp() {
         throw new Error(detail.error ?? `Analyze failed (${res.status})`)
       }
       const { clips: aiClips } = (await res.json()) as { clips: Clip[] }
-      setClips(aiClips)
-      if (aiClips.length > 0) {
+
+      // Attach the closest sampled frame as a thumbnail for each clip,
+      // so the cards show a real preview without re-running ffmpeg.
+      const enriched: Clip[] = aiClips.map((c) => {
+        const mid = (c.start + c.end) / 2
+        const inside = frames.filter((f) => f.timestamp >= c.start && f.timestamp <= c.end)
+        const pool = inside.length > 0 ? inside : frames
+        const closest = pool.reduce((best, f) =>
+          Math.abs(f.timestamp - mid) < Math.abs(best.timestamp - mid) ? f : best,
+        )
+        return { ...c, thumbnail: closest?.base64 }
+      })
+
+      setClips(enriched)
+      if (enriched.length > 0) {
         setActiveClip(0)
-        setRange({ start: aiClips[0].start, end: aiClips[0].end })
-        seek(aiClips[0].start)
+        setRange({ start: enriched[0].start, end: enriched[0].end })
+        seek(enriched[0].start)
       }
       setStatus({ kind: "ready" })
     } catch (e) {
@@ -220,15 +281,18 @@ export function ClipperApp() {
 
   const exportClip = async () => {
     if (!file) return
+    if (range.end - range.start < 0.1) {
+      setError("Selected range is too short. Drag the timeline handles to widen the selection.")
+      return
+    }
     setError(null)
     setStatus({ kind: "exporting", progress: 0 })
 
     try {
       const ffmpeg = await getFFmpeg(log)
-      const outName = socialMode ? "out.mp4" : "out.mp4"
 
       const onProgress = ({ progress }: { progress: number }) => {
-        setStatus({ kind: "exporting", progress })
+        setStatus({ kind: "exporting", progress: Math.max(0, Math.min(1, progress)) })
       }
       ffmpeg.on("progress", onProgress)
 
@@ -240,19 +304,25 @@ export function ClipperApp() {
             range.end.toFixed(2),
             "-i",
             INPUT_NAME,
+            // Smart center crop to 9:16 - this is what TikTok/Reels/Shorts expect.
+            // Crop to a 9:16 window from the center, then scale to 1080x1920.
             "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920,setsar=1",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
             "23",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
             "128k",
-            outName,
+            "-movflags",
+            "+faststart",
+            OUTPUT_NAME,
           ]
         : [
             // Fast stream-copy clip - keyframe aligned.
@@ -264,12 +334,18 @@ export function ClipperApp() {
             INPUT_NAME,
             "-c",
             "copy",
-            outName,
+            "-movflags",
+            "+faststart",
+            OUTPUT_NAME,
           ]
 
       await ffmpeg.exec(args)
-      const data = (await ffmpeg.readFile(outName)) as Uint8Array
+      const data = (await ffmpeg.readFile(OUTPUT_NAME)) as Uint8Array
       ffmpeg.off("progress", onProgress)
+
+      if (!data || data.length === 0) {
+        throw new Error("FFmpeg produced an empty file. Check the ffmpeg log for details.")
+      }
 
       const blob = new Blob([data.buffer as ArrayBuffer], { type: "video/mp4" })
       const url = URL.createObjectURL(blob)
@@ -286,7 +362,7 @@ export function ClipperApp() {
 
       setStatus({ kind: "done", url, filename })
       try {
-        await ffmpeg.deleteFile(outName)
+        await ffmpeg.deleteFile(OUTPUT_NAME)
       } catch {
         // ignore cleanup errors
       }
@@ -318,20 +394,26 @@ export function ClipperApp() {
     status.kind === "analyzing" ||
     status.kind === "exporting"
 
-  const statusLabel =
-    status.kind === "loading-ffmpeg"
-      ? "Booting FFmpeg worker..."
-      : status.kind === "loading-video"
-        ? "Loading video into FFmpeg..."
-        : status.kind === "analyzing"
-          ? "Gemini is analyzing frames..."
-          : status.kind === "exporting"
-            ? `Exporting... ${Math.round(status.progress * 100)}%`
-            : status.kind === "done"
-              ? "Export ready"
-              : status.kind === "ready"
-                ? "Ready"
-                : "Idle"
+  const statusLabel = (() => {
+    switch (status.kind) {
+      case "loading-ffmpeg":
+        return "Booting FFmpeg worker..."
+      case "loading-video":
+        return "Loading video into FFmpeg..."
+      case "analyzing":
+        return status.phase === "frames"
+          ? `Sampling frame ${status.current}/${status.total}...`
+          : "Gemini analyzing frames..."
+      case "exporting":
+        return `Exporting... ${Math.round(status.progress * 100)}%`
+      case "done":
+        return "Export ready"
+      case "ready":
+        return "Ready"
+      default:
+        return "Idle"
+    }
+  })()
 
   return (
     <div className="flex flex-col gap-6">
@@ -393,7 +475,7 @@ export function ClipperApp() {
                     {playing ? <Pause className="size-4" /> : <Play className="size-4" />}
                     {playing ? "Pause" : "Play"}
                   </Button>
-                  <span className="font-mono text-xs text-muted-foreground">
+                  <span className="max-w-[180px] truncate font-mono text-xs text-muted-foreground sm:max-w-xs">
                     {file?.name ?? ""}
                   </span>
                 </div>
@@ -406,7 +488,7 @@ export function ClipperApp() {
                       className="data-[state=checked]:bg-primary"
                     />
                     <Label htmlFor="social-mode" className="text-xs">
-                      Social mode 9:16
+                      9:16 smart crop
                     </Label>
                   </div>
                   <Button size="sm" onClick={exportClip} disabled={isBusy || duration === 0}>

@@ -84,11 +84,28 @@ export async function POST(req: Request) {
       ],
     })
 
+    // Clamp every clip into a sensible short-form window:
+    //   - within [0, duration]
+    //   - 15s minimum (when the source allows)
+    //   - 60s maximum
+    const minLen = Math.min(15, Math.max(1, duration * 0.1))
+    const maxLen = Math.min(60, duration)
+
     const clips = output.clips
       .map((c) => {
-        const start = Math.max(0, Math.min(c.start, duration - 1))
-        const end = Math.max(start + 1, Math.min(c.end, duration))
-        return { ...c, start, end }
+        let start = Math.max(0, Math.min(c.start, Math.max(0, duration - minLen)))
+        let end = Math.max(start + minLen, Math.min(c.end, duration))
+        if (end - start > maxLen) end = start + maxLen
+        if (end > duration) {
+          end = duration
+          start = Math.max(0, end - maxLen)
+        }
+        return {
+          ...c,
+          start: Number(start.toFixed(2)),
+          end: Number(end.toFixed(2)),
+          virality: Math.max(0, Math.min(100, c.virality)),
+        }
       })
       .sort((a, b) => a.start - b.start)
 
