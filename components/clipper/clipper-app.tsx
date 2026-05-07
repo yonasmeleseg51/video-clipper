@@ -99,7 +99,36 @@ export function ClipperApp() {
   const [logLines, setLogLines] = useState<string[]>([])
 
   const videoRef = useRef<HTMLVideoElement>(null)
+  // Track the pending play() promise so we can await it before pausing.
+  // HTMLMediaElement.play() returns a Promise, and pausing while it's still
+  // pending throws an AbortError that surfaces as an unhandled rejection.
+  const playPromiseRef = useRef<Promise<void> | null>(null)
   const isolated = typeof window !== "undefined" ? isCrossOriginIsolated() : false
+
+  const safePause = useCallback(async () => {
+    const v = videoRef.current
+    if (!v) return
+    try {
+      if (playPromiseRef.current) await playPromiseRef.current
+    } catch {
+      // play() was rejected (e.g. autoplay policy) - safe to ignore
+    }
+    if (!v.paused) v.pause()
+  }, [])
+
+  const safePlay = useCallback(async () => {
+    const v = videoRef.current
+    if (!v) return
+    try {
+      const p = v.play()
+      playPromiseRef.current = p
+      await p
+    } catch {
+      // Ignored - usually autoplay policy or a competing pause()
+    } finally {
+      playPromiseRef.current = null
+    }
+  }, [])
 
   const log = useCallback((line: string) => {
     setLogLines((prev) => [...prev.slice(-200), line])
@@ -127,12 +156,10 @@ export function ClipperApp() {
 
   // Stop playback automatically when reaching the end of the selected range
   useEffect(() => {
-    const v = videoRef.current
-    if (!v) return
     if (playing && current >= range.end - 0.05 && range.end > 0) {
-      v.pause()
+      void safePause()
     }
-  }, [current, playing, range.end])
+  }, [current, playing, range.end, safePause])
 
   const handleFile = useCallback(
     async (selected: File) => {
@@ -185,9 +212,9 @@ export function ClipperApp() {
       if (v.currentTime < range.start || v.currentTime >= range.end) {
         v.currentTime = range.start
       }
-      void v.play()
+      void safePlay()
     } else {
-      v.pause()
+      void safePause()
     }
   }
 
