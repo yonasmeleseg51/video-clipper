@@ -1,6 +1,7 @@
 "use client"
 
-import { Scissors, Sparkles } from "lucide-react"
+import { Check, Copy, Scissors, Sparkles } from "lucide-react"
+import { useState } from "react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -29,7 +30,17 @@ function formatTime(seconds: number) {
 }
 
 export function ClipCard({ index, clip, active, onSelect }: ClipCardProps) {
+  const [copied, setCopied] = useState(false)
   const duration = Math.max(0, clip.end - clip.start)
+
+  const copyToClipboard = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    const text = `${clip.title}\n\n${clip.reason}`
+    await navigator.clipboard.writeText(text)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
   return (
     <Card
       className={cn(
@@ -45,9 +56,20 @@ export function ClipCard({ index, clip, active, onSelect }: ClipCardProps) {
             {Math.round(clip.virality)}
           </Badge>
         </div>
-        <span className="font-mono text-xs text-muted-foreground">
-          {formatTime(clip.start)} - {formatTime(clip.end)}
-        </span>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="size-7 p-0 text-muted-foreground hover:text-foreground"
+            onClick={copyToClipboard}
+            title="Copy title and reason"
+          >
+            {copied ? <Check className="size-3.5 text-green-500" /> : <Copy className="size-3.5" />}
+          </Button>
+          <span className="font-mono text-xs text-muted-foreground">
+            {formatTime(clip.start)} - {formatTime(clip.end)}
+          </span>
+        </div>
       </div>
       <h4 className="text-pretty text-sm font-medium leading-snug">{clip.title}</h4>
       <p className="text-pretty text-xs leading-relaxed text-muted-foreground">{clip.reason}</p>

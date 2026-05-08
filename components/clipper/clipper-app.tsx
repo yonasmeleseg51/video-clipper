@@ -7,7 +7,10 @@ import {
   Loader2,
   Pause,
   Play,
+  Repeat,
   Sparkles,
+  Volume2,
+  VolumeX,
   Wand2,
   X,
 } from "lucide-react"
@@ -24,7 +27,7 @@ import { Switch } from "@/components/ui/switch"
 import { fetchFile, getFFmpeg, isCrossOriginIsolated } from "@/lib/ffmpeg-client"
 
 const INPUT_NAME = "input.mp4"
-const FRAME_COUNT = 8
+const FRAME_COUNT = 12
 
 type Status =
   | { kind: "idle" }
@@ -46,11 +49,14 @@ function uint8ToBase64(bytes: Uint8Array): string {
 }
 
 export function ClipperApp() {
+  const [mounted, setMounted] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [duration, setDuration] = useState(0)
   const [current, setCurrent] = useState(0)
   const [playing, setPlaying] = useState(false)
+  const [muted, setMuted] = useState(false)
+  const [loop, setLoop] = useState(false)
   const [range, setRange] = useState({ start: 0, end: 0 })
   const [clips, setClips] = useState<Clip[]>([])
   const [activeClip, setActiveClip] = useState<number | null>(null)
@@ -60,7 +66,12 @@ export function ClipperApp() {
   const [logLines, setLogLines] = useState<string[]>([])
 
   const videoRef = useRef<HTMLVideoElement>(null)
-  const isolated = typeof window !== "undefined" ? isCrossOriginIsolated() : false
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  const isolated = mounted ? isCrossOriginIsolated() : false
 
   const log = useCallback((line: string) => {
     setLogLines((prev) => [...prev.slice(-200), line])
@@ -73,7 +84,14 @@ export function ClipperApp() {
     const onTime = () => setCurrent(v.currentTime)
     const onPlay = () => setPlaying(true)
     const onPause = () => setPlaying(false)
-    const onEnded = () => setPlaying(false)
+    const onEnded = () => {
+      if (loop) {
+        v.currentTime = range.start
+        void v.play()
+      } else {
+        setPlaying(false)
+      }
+    }
     v.addEventListener("timeupdate", onTime)
     v.addEventListener("play", onPlay)
     v.addEventListener("pause", onPause)
@@ -84,16 +102,20 @@ export function ClipperApp() {
       v.removeEventListener("pause", onPause)
       v.removeEventListener("ended", onEnded)
     }
-  }, [videoUrl])
+  }, [videoUrl, loop, range.start])
 
   // Stop playback automatically when reaching the end of the selected range
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
     if (playing && current >= range.end - 0.05 && range.end > 0) {
-      v.pause()
+      if (loop) {
+        v.currentTime = range.start
+      } else {
+        v.pause()
+      }
     }
-  }, [current, playing, range.end])
+  }, [current, playing, range.end, range.start, loop])
 
   const handleFile = useCallback(
     async (selected: File) => {
@@ -225,7 +247,7 @@ export function ClipperApp() {
 
     try {
       const ffmpeg = await getFFmpeg(log)
-      const outName = socialMode ? "out.mp4" : "out.mp4"
+      const outName = "out.mp4"
 
       const onProgress = ({ progress }: { progress: number }) => {
         setStatus({ kind: "exporting", progress })
@@ -241,13 +263,13 @@ export function ClipperApp() {
             "-i",
             INPUT_NAME,
             "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            "split[main][bg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10[bgout];[main]scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bgout][fg]overlay=(W-w)/2:(H-h)/2",
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            "superfast",
             "-crf",
-            "23",
+            "20",
             "-c:a",
             "aac",
             "-b:a",
@@ -385,6 +407,7 @@ export function ClipperApp() {
                   onLoadedMetadata={handleLoadedMetadata}
                   className="h-full w-full"
                   playsInline
+                  muted={muted}
                 />
               </div>
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border bg-card/60 p-3">
@@ -393,7 +416,25 @@ export function ClipperApp() {
                     {playing ? <Pause className="size-4" /> : <Play className="size-4" />}
                     {playing ? "Pause" : "Play"}
                   </Button>
-                  <span className="font-mono text-xs text-muted-foreground">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setMuted(!muted)}
+                    disabled={duration === 0}
+                    className="size-8 p-0"
+                  >
+                    {muted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setLoop(!loop)}
+                    disabled={duration === 0}
+                    className={cn("size-8 p-0", loop && "text-primary bg-primary/10")}
+                  >
+                    <Repeat className="size-4" />
+                  </Button>
+                  <span className="hidden font-mono text-xs text-muted-foreground md:inline">
                     {file?.name ?? ""}
                   </span>
                 </div>
@@ -500,20 +541,34 @@ export function ClipperApp() {
 
             {status.kind === "done" && (
               <Card className="border-primary/40 bg-primary/5 p-4">
-                <div className="flex items-center gap-2 text-sm font-medium">
-                  <Download className="size-4 text-primary" />
-                  Export ready
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <Download className="size-4 text-primary" />
+                    Export ready
+                  </div>
+                  <Badge variant="outline" className="text-[10px] uppercase">
+                    {socialMode ? "9:16 Vertical" : "Original"}
+                  </Badge>
                 </div>
-                <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
-                  {status.filename}
-                </p>
-                <a
-                  href={status.url}
-                  download={status.filename}
-                  className="mt-3 inline-flex h-8 items-center justify-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90"
-                >
-                  Download again
-                </a>
+                <div className="mt-3 space-y-1">
+                  <p className="truncate font-mono text-[10px] text-muted-foreground">
+                    {status.filename}
+                  </p>
+                  {activeClip !== null && clips[activeClip] && (
+                    <p className="line-clamp-2 text-xs font-medium italic">
+                      &quot;{clips[activeClip].title}&quot;
+                    </p>
+                  )}
+                </div>
+                <div className="mt-4 flex gap-2">
+                  <a
+                    href={status.url}
+                    download={status.filename}
+                    className="flex-1 inline-flex h-8 items-center justify-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+                  >
+                    Download again
+                  </a>
+                </div>
               </Card>
             )}
           </div>
