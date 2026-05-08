@@ -36,9 +36,9 @@ function resolveModel(): { model: LanguageModel; via: "direct" | "gateway" } {
 
   if (apiKey) {
     const google = createGoogleGenerativeAI({ apiKey })
-    return { model: google("gemini-2.5-flash"), via: "direct" }
+    return { model: google("gemini-1.5-flash"), via: "direct" }
   }
-  return { model: "google/gemini-2.5-flash", via: "gateway" }
+  return { model: "google/gemini-1.5-flash", via: "gateway" }
 }
 
 export async function POST(req: Request) {
@@ -59,8 +59,12 @@ export async function POST(req: Request) {
     `The ${frames.length} attached frames were sampled at these timestamps (in seconds): ` +
     `${frames.map((f) => f.timestamp.toFixed(1)).join(", ")}. ` +
     `Identify exactly 3 non-overlapping segments that would perform best as vertical short-form clips ` +
-    `(TikTok / Reels / Shorts). Each clip MUST be between 15 and 60 seconds long, and start/end MUST ` +
-    `lie within [0, ${duration.toFixed(1)}]. Optimize for hooks, emotional peaks, surprise, and payoff. ` +
+    `(TikTok / Reels / Shorts). ` +
+    (duration < 45
+      ? `Since the video is short, each clip should be between 5 and 15 seconds long. `
+      : `Each clip MUST be between 15 and 60 seconds long. `) +
+    `Start and end timestamps MUST lie within [0, ${duration.toFixed(1)}]. ` +
+    `Optimize for hooks, emotional peaks, surprise, and payoff. ` +
     `Return a punchy title, the start and end timestamps, a one-sentence virality reason, and a ` +
     `virality score 0-100 for each.`
 
